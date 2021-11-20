@@ -44,11 +44,10 @@ bool dither = true;
 const char *DATA_FILE = "/data.txt";
 uint32_t lastCount;
 uint8_t ditherSpace[15360];
-//uint16_t _WaitingTimeStart = 1000;
 uint16_t waitingTime = 1000;
 int offsetX = 0; // Screen space centering.
 int offsetY = 0; // Screen space centering.
-
+uint32_t bootTime;
 
 //###############
 // Callbacks for the jpeg decoding.
@@ -121,8 +120,7 @@ uint32_t getCountSD() {
   return val;
 }
 
-void drawTempHumidityBattery() {
-  char batteryBuffer[20];
+int getBatteryPercent() {
   uint32_t vol = M5.getBatteryVoltage();
   if (vol < 3300) {
     vol = 3300;
@@ -130,7 +128,8 @@ void drawTempHumidityBattery() {
   else if (vol > 4350) {
     vol = 4350;
   }
-  // Get
+
+  // Calculate percent
   float battery = (float)(vol - 3300) / (float)(4350 - 3300);
   if (battery <= 0.01) {
     battery = 0.01;
@@ -138,7 +137,13 @@ void drawTempHumidityBattery() {
   if (battery > 1) {
     battery = 1;
   }
-  sprintf(batteryBuffer, "%d%%", (int)(battery * 100));
+  return round(battery * 100.0);
+}
+
+void drawTempHumidityBattery() {
+  char batteryBuffer[20];
+  int battery = getBatteryPercent();
+  sprintf(batteryBuffer, "%i%%", battery);
   char statusBuffer[256] = "CHARGING";
   M5.SHT30.UpdateData();
   float tem = M5.SHT30.GetTemperature();
@@ -204,6 +209,45 @@ void loadNextImage() {
       globalFileHandle = file; // Set the global variable for the JPG decode callback.
       lastCount = currentCount;
       storeCountSD(lastCount);
+      drawImage((char *) file.name());
+      break; // End the while(true) loop.
+    } // if (currentCount > lastCount)
+  } // while (true)
+}
+
+
+void loadLastImage() {
+  File root = SD.open("/");
+  if (!root) {
+    Serial.printf("Failed to open directory");
+    return;
+  }
+  if (!root.isDirectory()) {
+    Serial.printf("Not a directory");
+    return;
+  }
+  String lastFile;
+  lastCount = getCountSD();
+  uint32_t currentCount = 0;
+  while (true) {
+    File file = root.openNextFile();
+    if (!file) {
+      Serial.printf("Reached end of directory, restart!\n");
+      lastCount = 0;
+      currentCount = 0;
+      root.rewindDirectory();
+      continue; // Back to top of while(true);
+    }
+    if (is_jpg(file.name())) {
+      currentCount++;
+    }
+    else {
+      continue; // Back to top of while(true);
+    }
+    if (currentCount == lastCount) {
+      Serial.printf("Filename %s\n", file.name());
+      globalFileHandle = file; // Set the global variable for the JPG decode callback.
+      lastCount = currentCount;
       drawImage((char *) file.name());
       break; // End the while(true) loop.
     } // if (currentCount > lastCount)
@@ -289,7 +333,7 @@ void drawImage(char *fileName) {
   jpeg.setPixelType(FOUR_BIT_DITHERED);
   jpeg.decodeDither(ditherSpace, options | scaling);
   jpeg.close();
-  canvas.drawRightString(fileName, 960, 540, 1);
+  canvas.drawRightString(fileName, 920, 540, 1);
   drawTempHumidityBattery();
   canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
   waitingTime = _WaitingTimeStart;
@@ -302,33 +346,52 @@ void setup() {
   M5.RTC.begin();
   canvas.createCanvas(960, 540);
   canvas.setTextSize(2);
-  loadNextImage();
+  loadLastImage();
   waitingTime = _WaitingTimeStart;
+  bootTime = millis();
+  canvas.drawRightString("On", 960, 540, 1);
+  canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
 }
 
 void loop() {
-  while ((--waitingTime) > 0) {
-    delay(100);
-    M5.update();
-    if (M5.BtnL.wasPressed()) {
-      Serial.println("Previous image.");
-      waitingTime = 1;
-      uint32_t lastCount = getCountSD();
-      lastCount -= 2;
-      if ((lastCount) < 0) lastCount = 0;
-      storeCountSD(lastCount);
-    }
-    if (M5.BtnP.wasPressed()) {
-      Serial.println("Turning off.");
-      canvas.drawRightString("Off", 960, 540, 1);
-      canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
-      delay(500);
-      M5.shutdown();
-    }
-    if (M5.BtnR.wasPressed()) {
-      Serial.println("Next image.");
-      waitingTime = 1;
-    }
+  delay(100);
+  M5.update();
+
+  if (M5.BtnL.wasPressed()) {
+    Serial.println("Previous image.");
+    uint32_t lastCount = getCountSD();
+    lastCount -= 2;
+    if ((lastCount) < 0) lastCount = 0;
+    storeCountSD(lastCount);
+    bootTime = millis();
+    loadNextImage();
   }
-  loadNextImage();
+
+  if (M5.BtnP.wasPressed()) {
+    Serial.println("Turning off.");
+    canvas.drawRightString("Off", 960, 540, 1);
+    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+    delay(500);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_38, LOW);
+    esp_sleep_enable_gpio_wakeup();
+    esp_deep_sleep(3600 * 1000 * 1000);
+  }
+
+  if (M5.BtnR.wasPressed()) {
+    Serial.println("Next image.");
+    bootTime = millis();
+    loadNextImage();
+  }
+
+  if (millis() - bootTime > 60000 && getBatteryPercent() != 100) {
+    Serial.println("Turning off.");
+    canvas.drawRightString("Off", 960, 540, 1);
+    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+    delay(500);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_38, LOW);
+    esp_sleep_enable_gpio_wakeup();
+    esp_deep_sleep(3600 * 1000 * 1000);
+    bootTime = millis(); // Not reallly needed but when plugged in it never shuts down
+    Serial.println("Turned off?");
+  }
 }
